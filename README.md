@@ -175,6 +175,109 @@ You can control the website through environment variables.
 | `PUBLIC_SECRET_KEY` | Secret string for the project. Use for generating signatures for API calls | `null` |
 | `SITE_PASSWORD` | Set password for site, support multiple password separated by comma. If not set, site will be public | `null` |
 | `OPENAI_API_MODEL` | ID of the model to use. [List models](https://platform.openai.com/docs/api-reference/models/list) | `gpt-3.5-turbo` |
+| `PUBLIC_MAX_HISTORY_MESSAGES` | Max number of recent messages sent as chat context | `9` |
+
+## Architecture
+
+This is a small, flat Astro SSR app. There is no separate backend, database, or state-management library. Astro owns routing and deploy adapters; SolidJS owns the streaming chat UI; two API routes authenticate and proxy OpenAI Chat Completions.
+
+Coding agents should also read [`AGENTS.md`](./AGENTS.md).
+
+### Tech stack
+
+| Layer | Choice |
+| --- | --- |
+| Framework | Astro 2 (`output: 'server'`) |
+| Interactive UI | SolidJS |
+| Styling | UnoCSS (attributify, icons, typography) |
+| Markdown | markdown-it + KaTeX + highlight.js |
+| Package manager | pnpm 7 |
+| Runtime | Node standalone by default; Vercel / Netlify Edge via `OUTPUT` |
+
+### Repository layout
+
+```
+chatgpt-demo/
+├── src/                         # application code
+│   ├── pages/                   # file-based routes (pages + APIs)
+│   │   ├── index.astro          # chat page
+│   │   ├── password.astro       # site-password gate
+│   │   └── api/
+│   │       ├── auth.ts          # POST /api/auth
+│   │       └── generate.ts      # POST /api/generate
+│   ├── components/              # Astro shell + Solid chat UI
+│   ├── layouts/Layout.astro     # HTML shell, theme, PWA tags
+│   ├── utils/
+│   │   ├── openAI.ts            # request payload + SSE parsing
+│   │   └── auth.ts              # SHA-256 request signatures
+│   └── types.ts                 # ChatMessage / ErrorMessage
+├── plugins/disableBlocks.ts     # strips Node-only proxy code on Edge builds
+├── hack/                        # Docker entrypoint and env substitution
+├── public/                      # PWA icons
+├── astro.config.mjs
+└── .github/workflows/           # lint, Docker publish, upstream sync
+```
+
+Path alias: `@/*` → `src/*`.
+
+### Request flow
+
+```mermaid
+flowchart LR
+  Browser["Browser"] --> Index["/ index.astro"]
+  Index --> AuthCheck["POST /api/auth"]
+  AuthCheck -->|fail| Password["/password"]
+  Index --> Generator["Generator.tsx"]
+  Generator -->|"messages + sign + pass"| Generate["POST /api/generate"]
+  Generate --> Verify["password + signature"]
+  Verify --> OpenAI["OpenAI /v1/chat/completions"]
+  OpenAI -->|"SSE stream"| Generate
+  Generate -->|"text ReadableStream"| Generator
+```
+
+1. `/` loads Header, `Generator` (`client:load`), and Footer. A page script sends `localStorage.pass` to `/api/auth` and redirects to `/password` on failure.
+2. `Generator` keeps messages, system role, temperature, streaming text, and an `AbortController`. History is stored in `sessionStorage` (default last 9 messages as context).
+3. `POST /api/generate` checks `messages`, optional `SITE_PASSWORD`, and (in production) a `PUBLIC_SECRET_KEY` signature of `timestamp:lastMessage:secret`.
+4. The server calls `${OPENAI_API_BASE_URL}/v1/chat/completions` with `stream: true`, then `eventsource-parser` turns SSE chunks into a plain-text stream.
+
+`#vercel-disable-blocks` in `generate.ts` wraps `undici` `ProxyAgent` (`HTTPS_PROXY`). The Vite plugin `plugins/disableBlocks.ts` removes that block when `OUTPUT` is `vercel` or `netlify`, because Edge runtimes cannot use the HTTP proxy.
+
+### UI components
+
+```mermaid
+flowchart TB
+  Layout["Layout.astro"] --> Index["index.astro"]
+  Index --> Header["Header.astro"]
+  Index --> Generator["Generator.tsx"]
+  Index --> Footer["Footer.astro"]
+  Header --> Logo["Logo"]
+  Header --> Theme["Themetoggle"]
+  Generator --> SystemRole["SystemRoleSettings"]
+  Generator --> MessageItem["MessageItem"]
+  Generator --> ErrorItem["ErrorMessageItem"]
+  SystemRole --> SettingsSlider["SettingsSlider"]
+  SettingsSlider --> Slider["Slider.tsx / zag-js"]
+```
+
+- **Astro components** render the static shell: layout, header/footer, theme toggle, logo.
+- **`Generator.tsx`** is the page state hub: message list, system role, temperature, streaming, stick-to-bottom scrolling.
+- **`MessageItem.tsx`** renders Markdown, code copy, and regenerate on the last assistant message.
+- **`SystemRoleSettings.tsx`** can edit the system prompt only before the first message, and exposes a temperature slider (0–2).
+
+### Deploy adapters
+
+`astro.config.mjs` picks an adapter from `OUTPUT`:
+
+| `OUTPUT` | Adapter | Build command |
+| --- | --- | --- |
+| unset | `@astrojs/node` standalone | `pnpm build` |
+| `vercel` | `@astrojs/vercel/edge` | `pnpm build:vercel` |
+| `netlify` | `@astrojs/netlify/edge-functions` | `pnpm build:netlify` |
+
+Docker is a multi-stage build. `hack/docker-entrypoint.sh` rewrites env values into the compiled `dist/` files, then starts `node dist/server/entry.mjs`.
+
+Server-only secrets: `OPENAI_API_KEY`, `SITE_PASSWORD`, `HTTPS_PROXY`.  
+Values with a `PUBLIC_` prefix are inlined into the client: `PUBLIC_SECRET_KEY` (request signing) and `PUBLIC_MAX_HISTORY_MESSAGES`.
 
 ## Enable Automatic Updates
 
@@ -198,6 +301,8 @@ Q: Accelerate domestic access without the need for proxy deployment tutorial?
 A: You can refer to this tutorial: https://github.com/ddiu8081/chatgpt-demo/discussions/270
 
 ## Contributing
+
+For repository conventions and where to change code, see [`AGENTS.md`](./AGENTS.md).
 
 This project exists thanks to all those who contributed.
 

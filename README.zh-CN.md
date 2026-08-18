@@ -166,6 +166,109 @@ Environment: OPENAI_API_KEY=YOUR_OPEN_API_KEY
 | `PUBLIC_SECRET_KEY` | 项目的秘密字符串。用于生成 API 调用的签名 | `null` |
 | `SITE_PASSWORD` | 为网站设置密码，支持使用英文逗号创建多个密码。如果未设置，则该网站将是公开的 | `null` |
 | `OPENAI_API_MODEL` | 使用的 OpenAI 模型。[模型列表](https://platform.openai.com/docs/api-reference/models/list) | `gpt-3.5-turbo` |
+| `PUBLIC_MAX_HISTORY_MESSAGES` | 作为上下文发送的最近消息条数上限 | `9` |
+
+## 代码结构
+
+这是一个扁平的 Astro SSR 应用，没有独立 backend、数据库或状态管理库。Astro 负责路由和部署适配，SolidJS 负责流式对话 UI，两个 API 路由做鉴权并转发 OpenAI Chat Completions。
+
+面向编码 Agent 的约定见 [`AGENTS.md`](./AGENTS.md)。
+
+### 技术栈
+
+| 层 | 选择 |
+| --- | --- |
+| 框架 | Astro 2（`output: 'server'`） |
+| 交互 UI | SolidJS |
+| 样式 | UnoCSS（attributify + 图标 + typography） |
+| Markdown | markdown-it + KaTeX + highlight.js |
+| 包管理 | pnpm 7 |
+| 运行时 | 默认 Node standalone；可通过 `OUTPUT` 切到 Vercel / Netlify Edge |
+
+### 目录结构
+
+```
+chatgpt-demo/
+├── src/                         # 全部应用代码
+│   ├── pages/                   # 文件路由：页面 + API
+│   │   ├── index.astro          # 聊天主页
+│   │   ├── password.astro       # 站点密码页
+│   │   └── api/
+│   │       ├── auth.ts          # POST /api/auth
+│   │       └── generate.ts      # POST /api/generate
+│   ├── components/              # Astro 壳 + Solid 聊天 UI
+│   ├── layouts/Layout.astro     # HTML 骨架、主题、PWA
+│   ├── utils/
+│   │   ├── openAI.ts            # 请求体与 SSE 解析
+│   │   └── auth.ts              # SHA-256 请求签名
+│   └── types.ts                 # ChatMessage / ErrorMessage
+├── plugins/disableBlocks.ts     # Edge 构建时裁掉 Node 代理代码
+├── hack/                        # Docker 启动与环境变量替换
+├── public/                      # PWA 图标
+├── astro.config.mjs
+└── .github/workflows/           # lint、Docker 发布、上游同步
+```
+
+路径别名：`@/*` → `src/*`。
+
+### 请求链路
+
+```mermaid
+flowchart LR
+  Browser["浏览器"] --> Index["/ index.astro"]
+  Index --> AuthCheck["POST /api/auth"]
+  AuthCheck -->|失败| Password["/password"]
+  Index --> Generator["Generator.tsx"]
+  Generator -->|"messages + sign + pass"| Generate["POST /api/generate"]
+  Generate --> Verify["密码 + 签名校验"]
+  Verify --> OpenAI["OpenAI /v1/chat/completions"]
+  OpenAI -->|"SSE stream"| Generate
+  Generate -->|"ReadableStream 文本"| Generator
+```
+
+1. `/` 加载 Header、`Generator`（`client:load`）和 Footer。页面脚本用 `localStorage.pass` 请求 `/api/auth`，失败则跳到 `/password`。
+2. `Generator` 维护消息列表、system role、temperature、流式输出和 `AbortController`。会话存在 `sessionStorage`（默认只带最近 9 条作为上下文）。
+3. `POST /api/generate` 校验 `messages`、可选的 `SITE_PASSWORD`，以及生产环境下 `PUBLIC_SECRET_KEY` 对 `timestamp:lastMessage:secret` 的签名。
+4. 服务端请求 `${OPENAI_API_BASE_URL}/v1/chat/completions`（`stream: true`），再用 `eventsource-parser` 把 SSE 转成纯文本流。
+
+`generate.ts` 里 `#vercel-disable-blocks` 包住的是 `undici` 的 `ProxyAgent`（`HTTPS_PROXY`）。当 `OUTPUT` 为 `vercel` 或 `netlify` 时，Vite 插件 `plugins/disableBlocks.ts` 会裁掉这段，因为 Edge 运行时不支持该 HTTP 代理。
+
+### 前端组件
+
+```mermaid
+flowchart TB
+  Layout["Layout.astro"] --> Index["index.astro"]
+  Index --> Header["Header.astro"]
+  Index --> Generator["Generator.tsx"]
+  Index --> Footer["Footer.astro"]
+  Header --> Logo["Logo"]
+  Header --> Theme["Themetoggle"]
+  Generator --> SystemRole["SystemRoleSettings"]
+  Generator --> MessageItem["MessageItem"]
+  Generator --> ErrorItem["ErrorMessageItem"]
+  SystemRole --> SettingsSlider["SettingsSlider"]
+  SettingsSlider --> Slider["Slider.tsx / zag-js"]
+```
+
+- **Astro 组件**：静态壳（布局、页头页脚、主题切换、Logo）。
+- **`Generator.tsx`**：整页状态中心，负责消息列表、system role、temperature、流式输出、贴底滚动。
+- **`MessageItem.tsx`**：Markdown 渲染、代码复制，以及最后一条 assistant 消息的重试。
+- **`SystemRoleSettings.tsx`**：仅在还没有任何消息时可编辑 system prompt，并调节 temperature（0–2）。
+
+### 部署适配
+
+`astro.config.mjs` 用 `OUTPUT` 选择适配器：
+
+| `OUTPUT` | 适配器 | 构建命令 |
+| --- | --- | --- |
+| 未设置 | `@astrojs/node` standalone | `pnpm build` |
+| `vercel` | `@astrojs/vercel/edge` | `pnpm build:vercel` |
+| `netlify` | `@astrojs/netlify/edge-functions` | `pnpm build:netlify` |
+
+Docker 为多阶段构建。`hack/docker-entrypoint.sh` 会把环境变量写入编译后的 `dist/`，再启动 `node dist/server/entry.mjs`。
+
+仅服务端使用的密钥：`OPENAI_API_KEY`、`SITE_PASSWORD`、`HTTPS_PROXY`。  
+带 `PUBLIC_` 前缀的会进客户端：`PUBLIC_SECRET_KEY`（请求签名）、`PUBLIC_MAX_HISTORY_MESSAGES`。
 
 ## 开启同步更新
 
@@ -188,6 +291,8 @@ Q: Accelerate domestic access without the need for proxy deployment tutorial?
 A: 你可以参考此教程：https://github.com/ddiu8081/chatgpt-demo/discussions/270
 
 ## 参与贡献
+
+仓库约定和改代码的入口见 [`AGENTS.md`](./AGENTS.md)。
 
 这个项目的存在要感谢所有做出贡献的人。
 
